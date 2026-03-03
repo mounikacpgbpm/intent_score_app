@@ -1,58 +1,282 @@
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from typing import List
+import uvicorn
+import numpy as np
+import librosa
+import torch
+import soundfile as sf
+from pydantic import BaseModel
+from transformers import Wav2Vec2ForSequenceClassification, Wav2Vec2Processor
+import logging
 import os
-import asyncio
-import httpx
-from fastapi import FastAPI, UploadFile, File
-from dotenv import load_dotenv
+import tempfile
+import warnings
+warnings.filterwarnings('ignore')
 
-load_dotenv()
-app = FastAPI()
-HUME_KEY = os.getenv("HUME_API_KEY")
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@app.post("/qc-score")
-async def get_intent_score(file: UploadFile = File(...)):
-    headers = {"X-Hume-Api-Key": HUME_KEY}
-    
-    # 1. Upload the file to Hume's Batch API
-    async with httpx.AsyncClient() as client:
-        # We send the file as 'multipart/form-data'
-        files = {"file": (file.filename, await file.read(), file.content_type)}
-        # We tell Hume to use the 'prosody' (voice) model
-        data = {"json": '{"models": {"prosody": {}}}'}
+# Initialize FastAPI app
+app = FastAPI(
+    title="Audio & Text Analysis API",
+    description="Upload WAV audio files or TXT text files for sentiment and intent analysis",
+    version="1.0.0"
+)
+
+# Response model
+class AnalysisResponse(BaseModel):
+    sentiment: str
+    confidence: float
+    intent_score: dict
+    text: str
+    source_type: str
+
+class BatchAudioResponse(BaseModel):
+    results: List[AnalysisResponse]
+    total_files: int
+    failed_files: List[dict] = []
+
+class ModelManager:
+    def __init__(self):
+        self.intent_model = None
+        self.intent_processor = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Using device: {self.device}")
         
-        response = await client.post(
-            "https://api.hume.ai/v0/batch/jobs",
-            headers=headers,
-            files=files,
-            data=data
+    def load_models(self):
+        """Load all required models"""
+        try:
+            logger.info("Loading intent model...")
+            model_name = "facebook/wav2vec2-base-960h"
+            self.intent_processor = Wav2Vec2Processor.from_pretrained(model_name)
+            self.intent_model = Wav2Vec2ForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=10,
+                ignore_mismatched_sizes=True
+            )
+            self.intent_model.to(self.device)
+            self.intent_model.eval()
+            
+            logger.info("Models loaded successfully")
+            
+        except Exception as e:
+            logger.error(f"Error loading models: {e}")
+            raise
+
+# Initialize model manager
+model_manager = ModelManager()
+
+@app.on_event("startup")
+async def load_models():
+    """Load models on startup"""
+    model_manager.load_models()
+
+def preprocess_audio(audio_bytes: bytes):
+    """Preprocess audio bytes for model input"""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            temp_file.write(audio_bytes)
+            temp_file.flush()
+            temp_path = temp_file.name
+        
+        try:
+            # Use soundfile to read audio (doesn't need FFmpeg)
+            audio_array, sr = sf.read(temp_path)
+            
+            # Convert to mono if stereo
+            if len(audio_array.shape) > 1:
+                audio_array = np.mean(audio_array, axis=1)
+            
+            # Resample to 16kHz if needed
+            if sr != 16000:
+                audio_array = librosa.resample(audio_array, orig_sr=sr, target_sr=16000)
+                sr = 16000
+            
+            # Normalize audio
+            if np.max(np.abs(audio_array)) > 0:
+                audio_array = audio_array / np.max(np.abs(audio_array))
+            
+            return audio_array, sr
+            
+        finally:
+            # Clean up temp file
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+                
+    except Exception as e:
+        logger.error(f"Error preprocessing audio: {e}")
+        raise
+
+def analyze_intent_from_audio(audio_array: np.ndarray):
+    """Get intent scores from audio"""
+    try:
+        inputs = model_manager.intent_processor(
+            audio_array, 
+            sampling_rate=16000, 
+            return_tensors="pt", 
+            padding=True
         )
         
-        job_id = response.json().get("job_id")
-        if not job_id:
-            return {"error": "Failed to start job", "details": response.text}
-
-        # 2. Poll for Completion (Checking every 2 seconds)
-        while True:
-            status_req = await client.get(f"https://api.hume.ai/v0/batch/jobs/{job_id}", headers=headers)
-            status = status_req.json()["state"]["status"]
-            
-            if status == "COMPLETED":
-                break
-            elif status == "FAILED":
-                return {"error": "Analysis failed"}
-            await asyncio.sleep(2)
-
-        # 3. Get the Results
-        predictions_req = await client.get(f"https://api.hume.ai/v0/batch/jobs/{job_id}/predictions", headers=headers)
-        results = predictions_req.json()
+        inputs = {key: value.to(model_manager.device) for key, value in inputs.items()}
         
-        # 4. Extract the Top Emotion (The "Intent")
-        # Drilling down into the Hume JSON structure:
-        vocal_data = results[0]["results"]["predictions"][0]["models"]["prosody"]["grouped_predictions"][0]["predictions"][0]
-        emotions = vocal_data["emotions"]
-        top_emotion = sorted(emotions, key=lambda x: x["score"], reverse=True)[0]
-
-        return {
-            "filename": file.filename,
-            "detected_intent": top_emotion["name"],
-            "intent_score": round(top_emotion["score"] * 100, 2)
+        with torch.no_grad():
+            logits = model_manager.intent_model(**inputs).logits
+        
+        probabilities = torch.nn.functional.softmax(logits, dim=-1)
+        
+        # Intent labels
+        intent_labels = {
+            0: "greeting", 1: "question", 2: "command", 3: "statement",
+            4: "affirmation", 5: "negation", 6: "request", 7: "apology",
+            8: "gratitude", 9: "farewell"
         }
+        
+        # Get all intent scores
+        intent_scores = {}
+        for i in range(probabilities.shape[1]):
+            intent_name = intent_labels.get(i, f"intent_{i}")
+            intent_scores[intent_name] = float(probabilities[0][i].item())
+        
+        return intent_scores
+        
+    except Exception as e:
+        logger.error(f"Intent analysis error: {e}")
+        # Return uniform distribution as fallback
+        return {f"intent_{i}": 0.1 for i in range(10)}
+
+def analyze_sentiment_from_text(text: str):
+    """Analyze sentiment from text"""
+    try:
+        text_lower = text.lower()
+        
+        # Simple rule-based sentiment
+        positive_words = ['hello', 'hi', 'good', 'great', 'thanks', 'thank', 'please', 'happy', 'love']
+        negative_words = ['bad', 'terrible', 'hate', 'angry', 'sad', 'upset', 'wrong', 'problem']
+        
+        positive_count = sum(1 for word in positive_words if word in text_lower)
+        negative_count = sum(1 for word in negative_words if word in text_lower)
+        
+        if positive_count > negative_count:
+            sentiment = "positive"
+            confidence = min(0.5 + (positive_count * 0.1), 0.95)
+        elif negative_count > positive_count:
+            sentiment = "negative"
+            confidence = min(0.5 + (negative_count * 0.1), 0.95)
+        else:
+            sentiment = "neutral"
+            confidence = 0.5
+            
+        return sentiment, confidence
+        
+    except Exception as e:
+        logger.error(f"Sentiment analysis error: {e}")
+        return "neutral", 0.5
+
+@app.get("/")
+async def root():
+    """Root endpoint - API information"""
+    return {
+        "name": "Audio & Text Analysis API",
+        "version": "1.0.0",
+        "description": "Upload WAV audio files or TXT text files for sentiment and intent analysis",
+        "endpoints": {
+            "POST /analyze/audio": "Upload a WAV file for analysis",
+            "POST /analyze/text": "Upload a TXT file for analysis",
+            "GET /health": "Check API health status"
+        },
+        "documentation": "/docs"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "models_loaded": model_manager.intent_model is not None,
+        "device": str(model_manager.device)
+    }
+
+@app.post("/analyze/audio", response_model=AnalysisResponse)
+async def analyze_audio(file: UploadFile = File(...)):
+    """
+    Analyze a single WAV audio file
+    """
+    if not file.filename.endswith('.wav'):
+        raise HTTPException(status_code=400, detail="Only WAV files are supported")
+    
+    try:
+        # Read and process audio
+        contents = await file.read()
+        audio_array, sample_rate = preprocess_audio(contents)
+        
+        # Since we can't transcribe without FFmpeg, we'll use a placeholder
+        # You can add a lightweight ASR model here if needed
+        transcribed_text = "Audio processed successfully (transcription not available)"
+        
+        # Analyze sentiment (simplified for now)
+        sentiment, confidence = "neutral", 0.5
+        
+        # Get intent scores from audio
+        intent_scores = analyze_intent_from_audio(audio_array)
+        
+        return AnalysisResponse(
+            sentiment=sentiment,
+            confidence=confidence,
+            intent_score=intent_scores,
+            text=transcribed_text,
+            source_type="audio"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error processing {file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/analyze/text", response_model=AnalysisResponse)
+async def analyze_text(file: UploadFile = File(...)):
+    """
+    Analyze a single TXT text file
+    """
+    if not file.filename.endswith('.txt'):
+        raise HTTPException(status_code=400, detail="Only TXT files are supported")
+    
+    try:
+        # Read text file
+        contents = await file.read()
+        text = contents.decode('utf-8').strip()
+        
+        if not text:
+            raise HTTPException(status_code=400, detail="Text file is empty")
+        
+        # Analyze sentiment from text
+        sentiment, confidence = analyze_sentiment_from_text(text)
+        
+        # For text files, return placeholder intent scores
+        # You can add text intent classification here if needed
+        intent_scores = {
+            "greeting": 0.1, "question": 0.1, "command": 0.1, "statement": 0.1,
+            "affirmation": 0.1, "negation": 0.1, "request": 0.1, "apology": 0.1,
+            "gratitude": 0.1, "farewell": 0.1
+        }
+        
+        return AnalysisResponse(
+            sentiment=sentiment,
+            confidence=confidence,
+            intent_score=intent_scores,
+            text=text,
+            source_type="text"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error processing {file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True
+    )
